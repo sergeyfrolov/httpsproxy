@@ -16,9 +16,6 @@
 package main
 
 import (
-	"bufio"
-	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,10 +32,12 @@ import (
 	"syscall"
 
 	pt "git.torproject.org/pluggable-transports/goptlib.git"
-	"golang.org/x/net/http2"
+	"github.com/caddyserver/forwardproxy/httpclient"
+	tls "github.com/refraction-networking/utls"
 )
 
 var ptInfo pt.ClientInfo
+var utlsRoller *tls.Roller
 
 // When a connection handler starts, +1 is written to this channel; when it
 // ends, -1 is written.
@@ -53,14 +52,13 @@ var handlerChan = make(chan int)
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
 func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
 	flusher, ok := dst.(http.Flusher)
-	if !ok {
-		return io.CopyBuffer(dst, src, buf)
-	}
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			nw, ew := dst.Write(buf[0:nr])
-			flusher.Flush()
+			if ok {
+				flusher.Flush()
+			}
 			if nw > 0 {
 				written += int64(nw)
 			}
@@ -84,36 +82,18 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, er
 }
 
 // simple copy loop without padding, works with http/1.1
-// TODO: we can't pad, but we probably can split
 func copyLoop(local, remote net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	buf1 := make([]byte, 65536)
+	buf2 := make([]byte, 65536)
 	go func() {
-		io.Copy(remote, local)
+		flushingIoCopy(local, remote, buf1)
 		wg.Done()
 	}()
 	go func() {
-		io.Copy(local, remote)
-		wg.Done()
-	}()
-	// TODO: try not to spawn extra goroutine
-
-	wg.Wait()
-}
-
-func h2copyLoop(w1 io.Writer, r1 io.Reader, w2 io.Writer, r2 io.Reader) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	buf1 := make([]byte, 16384)
-	buf2 := make([]byte, 16384)
-	go func() {
-		flushingIoCopy(w1, r1, buf1)
-		wg.Done()
-	}()
-	go func() {
-		flushingIoCopy(w2, r2, buf2)
+		flushingIoCopy(remote, local, buf2)
 		wg.Done()
 	}()
 	// TODO: try not to spawn extra goroutine
@@ -124,20 +104,20 @@ func h2copyLoop(w1 io.Writer, r1 io.Reader, w2 io.Writer, r2 io.Reader) {
 func parseTCPAddr(s string) (*net.TCPAddr, error) {
 	hostStr, portStr, err := net.SplitHostPort(s)
 	if err != nil {
-		fmt.Printf("net.SplitHostPort(%s) failed: %+v", s, err)
+		log.Printf("net.SplitHostPort(%s) failed: %+v", s, err)
 		return nil, err
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		fmt.Printf("strconv.Atoi(%s) failed: %+v", portStr, err)
+		log.Printf("strconv.Atoi(%s) failed: %+v", portStr, err)
 		return nil, err
 	}
 
 	ip := net.ParseIP(hostStr)
 	if ip == nil {
 		err = errors.New("net.ParseIP(" + s + ") returned nil")
-		fmt.Printf("%+v\n", err)
+		log.Printf("%+v\n", err)
 		return nil, err
 	}
 
@@ -155,6 +135,7 @@ func handler(conn *pt.SocksConn) error {
 
 	guardTCPAddr, err := parseTCPAddr(conn.Req.Target)
 	if err != nil {
+		log.Println(err)
 		conn.Reject()
 		return err
 	}
@@ -162,22 +143,50 @@ func handler(conn *pt.SocksConn) error {
 	webproxyUrlArg, ok := conn.Req.Args.Get("url")
 	if !ok {
 		err := errors.New("address of webproxy in form of `url=https://username:password@example.com` is required")
+		log.Println(err)
 		conn.Reject()
 		return err
 	}
 
-	httpsClient, err := NewHTTPSClient(webproxyUrlArg)
+	proxyUrl, err := url.Parse(webproxyUrlArg)
 	if err != nil {
-		log.Printf("NewHTTPSClient(%s, nil) failed: %s\n", webproxyUrlArg, err)
+		log.Println(err)
 		conn.Reject()
 		return err
 	}
 
-	err = httpsClient.Connect(conn.Req.Target)
-	if err != nil {
-		log.Printf("httpsClient.Connect(%s, nil) failed: %s\n", conn.Req.Target, err)
+	if proxyUrl.Scheme != "https" {
+		err = errors.New("Scheme " + proxyUrl.Scheme + " is not supported")
+		log.Println(err)
 		conn.Reject()
 		return err
+	}
+
+	if proxyUrl.Host == "" {
+		conn.Reject()
+		return errors.New("misparsed `url=`, make sure to specify full url like https://username:password@hostname.com:443/")
+	}
+
+	if proxyUrl.Port() == "" {
+		proxyUrl.Host = net.JoinHostPort(proxyUrl.Host, "443")
+	}
+
+	dialer, err := httpclient.NewHTTPConnectDialer(webproxyUrlArg)
+	if err != nil {
+		log.Printf("httpclient.NewHTTPConnectDialer(%s) failed: %s\n", webproxyUrlArg, err)
+		conn.Reject()
+		return err
+	}
+	dialer.DialTLS = func(network string, address string) (net.Conn, string, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, "", err
+		}
+		conn, err := utlsRoller.Dial(network, address, host)
+		if err != nil {
+			return nil, "", err
+		}
+		return conn, conn.ConnectionState().NegotiatedProtocol, nil
 	}
 
 	err = conn.Grant(guardTCPAddr)
@@ -187,7 +196,15 @@ func handler(conn *pt.SocksConn) error {
 		return err
 	}
 
-	return httpsClient.CopyLoop(conn)
+	remoteConn, err := dialer.Dial("tcp", conn.Req.Target)
+	if err != nil {
+		log.Printf("dialer.Dial(%s) failed: %s\n", conn.Req.Target, err)
+		conn.Reject()
+		return err
+	}
+
+	copyLoop(conn, remoteConn)
+	return nil
 }
 
 func acceptLoop(ln *pt.SocksListener) error {
@@ -229,6 +246,13 @@ func main() {
 		}
 		defer f.Close()
 		log.SetOutput(f)
+	}
+
+	utlsRoller, err = tls.NewRoller()
+	if err != nil {
+		pt.CmethodError("httpsproxy",
+			fmt.Sprintf("could not creat utls.Roller: %v", err))
+		os.Exit(3)
 	}
 
 	listeners := make([]net.Listener, 0)
@@ -281,156 +305,4 @@ func main() {
 	for numHandlers > 0 {
 		numHandlers += <-handlerChan
 	}
-}
-
-type HTTPConnectClient struct {
-	Header    http.Header
-	ProxyHost string
-	TlsConf   tls.Config
-
-	Conn *tls.Conn
-
-	In  io.Writer
-	Out io.Reader
-}
-
-// NewHTTPSClient creates one-time use client to tunnel traffic via HTTPS proxy.
-// If spkiFp is set, HTTPSClient will use it as SPKI fingerprint to confirm identity of the
-// proxy, instead of relying on standard PKI CA roots
-func NewHTTPSClient(proxyUrlStr string) (*HTTPConnectClient, error) {
-	proxyUrl, err := url.Parse(proxyUrlStr)
-	if err != nil {
-		return nil, err
-	}
-
-	switch proxyUrl.Scheme {
-	case "http", "":
-		fallthrough
-	default:
-		return nil, errors.New("Scheme " + proxyUrl.Scheme + " is not supported")
-	case "https":
-	}
-
-	if proxyUrl.Host == "" {
-		return nil, errors.New("misparsed `url=`, make sure to specify full url like https://username:password@hostname.com:443/")
-	}
-
-	if proxyUrl.Port() == "" {
-		proxyUrl.Host = net.JoinHostPort(proxyUrl.Host, "443")
-	}
-
-	tlsConf := tls.Config{
-		NextProtos: []string{"h2", "http/1.1"},
-		ServerName: proxyUrl.Hostname(),
-	}
-
-	client := &HTTPConnectClient{
-		Header:    make(http.Header),
-		ProxyHost: proxyUrl.Host,
-		TlsConf:   tlsConf,
-	}
-
-	if proxyUrl.User.Username() != "" {
-		password, _ := proxyUrl.User.Password()
-		client.Header.Set("Proxy-Authorization", "Basic "+
-			base64.StdEncoding.EncodeToString([]byte(proxyUrl.User.Username()+":"+password)))
-	}
-	return client, nil
-}
-
-func (c *HTTPConnectClient) Connect(target string) error {
-	req := &http.Request{
-		Method: "CONNECT",
-		URL:    &url.URL{Host: target},
-		Header: c.Header,
-		Host:   target,
-	}
-
-	tcpConn, err := net.Dial("tcp", c.ProxyHost)
-	if err != nil {
-		return err
-	}
-
-	c.Conn = tls.Client(tcpConn, &c.TlsConf)
-
-	err = c.Conn.Handshake()
-	if err != nil {
-		return err
-	}
-
-	var resp *http.Response
-	switch c.Conn.ConnectionState().NegotiatedProtocol {
-	case "":
-		fallthrough
-	case "http/1.1":
-		req.Proto = "HTTP/1.1"
-		req.ProtoMajor = 1
-		req.ProtoMinor = 1
-
-		err = req.Write(c.Conn)
-		if err != nil {
-			c.Conn.Close()
-			return err
-		}
-
-		resp, err = http.ReadResponse(bufio.NewReader(c.Conn), req)
-		if err != nil {
-			c.Conn.Close()
-			return err
-		}
-
-		c.In = c.Conn
-		c.Out = c.Conn
-	case "h2":
-		req.Proto = "HTTP/2.0"
-		req.ProtoMajor = 2
-		req.ProtoMinor = 0
-		pr, pw := io.Pipe()
-		req.Body = ioutil.NopCloser(pr)
-
-		t := http2.Transport{}
-		h2client, err := t.NewClientConn(c.Conn)
-		if err != nil {
-			c.Conn.Close()
-			return err
-		}
-
-		resp, err = h2client.RoundTrip(req)
-		if err != nil {
-			c.Conn.Close()
-			return err
-		}
-
-		c.In = pw
-		c.Out = resp.Body
-	default:
-		c.Conn.Close()
-		return errors.New("negotiated unsupported application layer protocol: " +
-			c.Conn.ConnectionState().NegotiatedProtocol)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		c.Conn.Close()
-		return errors.New("Proxy responded with non 200 code: " + resp.Status)
-	}
-
-	return nil
-}
-
-func (c *HTTPConnectClient) CopyLoop(conn net.Conn) error {
-	defer c.Conn.Close()
-	defer conn.Close()
-
-	switch c.Conn.ConnectionState().NegotiatedProtocol {
-	case "":
-		fallthrough
-	case "http/1.1":
-		copyLoop(conn, c.Conn)
-	case "h2":
-		h2copyLoop(c.In, conn, conn, c.Out)
-	default:
-		return errors.New("negotiated unsupported application layer protocol: " +
-			c.Conn.ConnectionState().NegotiatedProtocol)
-	}
-	return nil
 }
